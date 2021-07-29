@@ -19,9 +19,12 @@ import (
 	"context"
 	"net"
 
+	grpc_prometheus "github.com/grpc-ecosystem/go-grpc-prometheus"
 	otgrpc "github.com/opentracing-contrib/go-grpc"
 	"github.com/opentracing/opentracing-go"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/uber/jaeger-lib/metrics"
+
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
 
@@ -30,27 +33,51 @@ import (
 
 // Server implements jaeger-demo-frontend service
 type Server struct {
-	hostPort string
-	tracer   opentracing.Tracer
-	logger   log.Factory
-	redis    *Redis
-	server   *grpc.Server
+	hostPort          string
+	tracer            opentracing.Tracer
+	logger            log.Factory
+	redis             *Redis
+	server            *grpc.Server
+	totalRequest      prometheus.Counter
+	successfulRequest prometheus.Counter
 }
 
 var _ DriverServiceServer = (*Server)(nil)
 
 // NewServer creates a new driver.Server
 func NewServer(hostPort string, tracer opentracing.Tracer, metricsFactory metrics.Factory, logger log.Factory) *Server {
-	server := grpc.NewServer(grpc.UnaryInterceptor(
-		otgrpc.OpenTracingServerInterceptor(tracer)),
-		grpc.StreamInterceptor(
-			otgrpc.OpenTracingStreamServerInterceptor(tracer)))
+	successfulRequest := prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Namespace: "hotrod_driver_service",
+			Name:      "successful_request",
+			Help:      "Number of HTTP 200 Requests",
+		})
+
+	totalRequest := prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Namespace: "hotrod_driver_service",
+			Name:      "total_request",
+			Help:      "Number of Total Requests",
+		})
+
+	server := grpc.NewServer(
+		grpc.ChainUnaryInterceptor(
+			otgrpc.OpenTracingServerInterceptor(tracer),
+			grpc_prometheus.UnaryServerInterceptor,
+		),
+		grpc.ChainStreamInterceptor(
+			grpc_prometheus.StreamServerInterceptor,
+			otgrpc.OpenTracingStreamServerInterceptor(tracer),
+		))
+
 	return &Server{
-		hostPort: hostPort,
-		tracer:   tracer,
-		logger:   logger,
-		server:   server,
-		redis:    newRedis(metricsFactory, logger),
+		hostPort:          hostPort,
+		tracer:            tracer,
+		logger:            logger,
+		server:            server,
+		redis:             newRedis(metricsFactory, logger),
+		totalRequest:      totalRequest,
+		successfulRequest: successfulRequest,
 	}
 }
 
@@ -61,6 +88,10 @@ func (s *Server) Run() error {
 		s.logger.Bg().Fatal("Unable to create http listener", zap.Error(err))
 	}
 	RegisterDriverServiceServer(s.server, s)
+
+	prometheus.MustRegister(s.successfulRequest)
+	prometheus.MustRegister(s.totalRequest)
+
 	err = s.server.Serve(lis)
 	if err != nil {
 		s.logger.Bg().Fatal("Unable to start gRPC server", zap.Error(err))
@@ -72,13 +103,13 @@ func (s *Server) Run() error {
 func (s *Server) FindNearest(ctx context.Context, location *DriverLocationRequest) (*DriverLocationResponse, error) {
 	s.logger.For(ctx).Info("Searching for nearby drivers", zap.String("location", location.Location))
 	driverIDs := s.redis.FindDriverIDs(ctx, location.Location)
-
 	retMe := make([]*DriverLocation, len(driverIDs))
 	for i, driverID := range driverIDs {
 		var drv Driver
 		var err error
 		for i := 0; i < 3; i++ {
 			drv, err = s.redis.GetDriver(ctx, driverID)
+			s.totalRequest.Inc()
 			if err == nil {
 				break
 			}
@@ -93,6 +124,7 @@ func (s *Server) FindNearest(ctx context.Context, location *DriverLocationReques
 			Location: drv.Location,
 		}
 	}
+	s.successfulRequest.Inc()
 	s.logger.For(ctx).Info("Search successful", zap.Int("num_drivers", len(retMe)))
 	return &DriverLocationResponse{Locations: retMe}, nil
 }

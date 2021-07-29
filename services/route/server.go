@@ -26,8 +26,10 @@ import (
 
 	"github.com/opentracing/opentracing-go"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/pyroscope-io/pyroscope/pkg/agent/profiler"
 	"go.uber.org/zap"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/yashrsharma44/hotrod/pkg/delay"
 	"github.com/yashrsharma44/hotrod/pkg/httperr"
 	"github.com/yashrsharma44/hotrod/pkg/log"
@@ -37,24 +39,63 @@ import (
 
 // Server implements Route service
 type Server struct {
-	hostPort string
-	tracer   opentracing.Tracer
-	logger   log.Factory
+	hostPort           string
+	tracer             opentracing.Tracer
+	logger             log.Factory
+	successfulRequest  prometheus.Counter
+	totalRequest       prometheus.Counter
+	serverErrorRequest prometheus.Counter
 }
 
 // NewServer creates a new route.Server
 func NewServer(hostPort string, tracer opentracing.Tracer, logger log.Factory) *Server {
+	successfulRequest := prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Namespace: "hotrod",
+			Name:      "Requests_200_HTTP",
+			Help:      "Number of HTTP 200 Requests",
+		})
+
+	totalRequest := prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Namespace: "hotrod",
+			Name:      "Total_Requests",
+			Help:      "Number of Total Requests",
+		})
+
+	serverErrorRequest := prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Namespace: "hotrod",
+			Name:      "Internal_Server_Error_Requests",
+			Help:      "Total number of Internal Server Error Requests",
+		})
+
 	return &Server{
-		hostPort: hostPort,
-		tracer:   tracer,
-		logger:   logger,
+		hostPort:           hostPort,
+		tracer:             tracer,
+		logger:             logger,
+		successfulRequest:  successfulRequest,
+		totalRequest:       totalRequest,
+		serverErrorRequest: serverErrorRequest,
 	}
 }
 
 // Run starts the Route server
 func (s *Server) Run() error {
+	URL := "http://" + s.hostPort
+	profiler.Start(profiler.Config{
+		ApplicationName: "hotrod.route.app",
+
+		// replace this with the address of pyroscope server
+		ServerAddress: "http://localhost:4040",
+	})
+
+	prometheus.MustRegister(s.successfulRequest)
+	prometheus.MustRegister(s.totalRequest)
+	prometheus.MustRegister(s.serverErrorRequest)
+
 	mux := s.createServeMux()
-	s.logger.Bg().Info("Starting", zap.String("address", "http://"+s.hostPort))
+	s.logger.Bg().Info("Starting", zap.String("address", URL))
 	return http.ListenAndServe(s.hostPort, mux)
 }
 
@@ -67,6 +108,7 @@ func (s *Server) createServeMux() http.Handler {
 }
 
 func (s *Server) route(w http.ResponseWriter, r *http.Request) {
+	s.totalRequest.Inc()
 	ctx := r.Context()
 	s.logger.For(ctx).Info("HTTP request received", zap.String("method", r.Method), zap.Stringer("url", r.URL))
 	if err := r.ParseForm(); httperr.HandleError(w, err, http.StatusBadRequest) {
@@ -90,10 +132,13 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request) {
 
 	data, err := json.Marshal(response)
 	if httperr.HandleError(w, err, http.StatusInternalServerError) {
+
+		s.serverErrorRequest.Inc()
 		s.logger.For(ctx).Error("cannot marshal response", zap.Error(err))
 		return
 	}
 
+	s.successfulRequest.Inc()
 	w.Header().Set("Content-Type", "application/json")
 	w.Write(data)
 }

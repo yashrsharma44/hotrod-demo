@@ -22,6 +22,8 @@ import (
 	"path"
 
 	"github.com/opentracing/opentracing-go"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/pyroscope-io/pyroscope/pkg/agent/profiler"
 	"go.uber.org/zap"
 
 	"github.com/jaegertracing/jaeger/pkg/httpfs"
@@ -70,8 +72,15 @@ func NewServer(options ConfigOptions, tracer opentracing.Tracer, logger log.Fact
 
 // Run starts the frontend server
 func (s *Server) Run() error {
+	URL := "http://" + path.Join(s.hostPort, s.basepath)
+	profiler.Start(profiler.Config{
+		ApplicationName: "hotrod.frontend.app",
+
+		// replace this with the address of pyroscope server
+		ServerAddress: "http://localhost:4040",
+	})
 	mux := s.createServeMux()
-	s.logger.Bg().Info("Starting", zap.String("address", "http://"+path.Join(s.hostPort, s.basepath)))
+	s.logger.Bg().Info("Starting", zap.String("address", URL))
 	return http.ListenAndServe(s.hostPort, mux)
 }
 
@@ -81,6 +90,7 @@ func (s *Server) createServeMux() http.Handler {
 	mux.Handle(p, http.StripPrefix(p, http.FileServer(s.assetFS)))
 	mux.Handle(path.Join(p, "/dispatch"), http.HandlerFunc(s.dispatch))
 	mux.Handle(path.Join(p, "/config"), http.HandlerFunc(s.config))
+	mux.Handle("/metrics", promhttp.Handler())
 	return mux
 }
 
